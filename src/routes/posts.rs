@@ -1,7 +1,7 @@
 use comrak::{markdown_to_html, ComrakOptions};
 use heck::KebabCase;
 use rocket::request::Form;
-use rocket::response::Redirect;
+use rocket::response::{Redirect, Flash};
 use rocket_contrib::Template;
 use serde_json;
 
@@ -15,6 +15,7 @@ use models::{
     users::User
 };
 use utils;
+use safe_string::SafeString;
 
 #[get("/~/<blog>/<slug>", rank = 4)]
 fn details(blog: String, slug: String, conn: DbConn, user: Option<User>) -> Template {
@@ -57,9 +58,9 @@ fn activity_details(_blog: String, slug: String, conn: DbConn) -> ActivityPub {
     activity_pub(act)
 }
 
-#[get("/~/<_blog>/new", rank = 2)]
-fn new_auth(_blog: String) -> Redirect {
-    utils::requires_login()
+#[get("/~/<blog>/new", rank = 2)]
+fn new_auth(blog: String) -> Flash<Redirect> {
+    utils::requires_login("You need to be logged in order to write a new post", &format!("/~/{}/new",blog))
 }
 
 #[get("/~/<_blog>/new", rank = 1)]
@@ -100,7 +101,7 @@ fn create(blog_name: String, data: Form<NewPostForm>, user: User, conn: DbConn) 
         blog_id: blog.id,
         slug: slug.to_string(),
         title: form.title.to_string(),
-        content: content,
+        content: SafeString::new(&content),
         published: true,
         license: form.license.to_string(),
         ap_url: "".to_string()

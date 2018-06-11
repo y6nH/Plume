@@ -1,7 +1,7 @@
-use activitystreams_types::collection::OrderedCollection;
+use activitypub::collection::OrderedCollection;
 use rocket::{
     request::Form,
-    response::Redirect
+    response::{Redirect, Flash}
 };
 use rocket_contrib::Template;
 use serde_json;
@@ -24,6 +24,7 @@ fn details(name: String, conn: DbConn, user: Option<User>) -> Template {
     Template::render("blogs/details", json!({
         "blog": blog,
         "account": user,
+        "is_author": user.map(|x| x.is_author_in(&*conn, blog)),
         "recents": recents.into_iter().map(|p| {
             json!({
                 "post": p,
@@ -51,6 +52,11 @@ fn new(user: User) -> Template {
     Template::render("blogs/new", json!({
         "account": user
     }))
+}
+
+#[get("/blogs/new", rank = 2)]
+fn new_auth() -> Flash<Redirect>{
+    utils::requires_login("You need to be logged in order to create a new blog", "/blogs/new")
 }
 
 #[derive(FromForm)]
