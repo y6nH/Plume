@@ -1,14 +1,14 @@
 use activitypub::activity;
 use chrono;
 use diesel::{self, PgConnection, QueryDsl, RunQueryDsl, ExpressionMethods};
-use serde_json;
 
 use activity_pub::{
+    Id,
     IntoId,
-    actor::Actor,
-    object::Object
+    inbox::{FromActivity, Deletable, Notify}
 };
 use models::{
+    notifications::*,
     posts::Post,
     users::User
 };
@@ -32,12 +32,10 @@ pub struct NewLike {
 }
 
 impl Like {
-    pub fn insert(conn: &PgConnection, new: NewLike) -> Like {
-        diesel::insert_into(likes::table)
-            .values(new)
-            .get_result(conn)
-            .expect("Unable to insert new like")
-    }
+    insert!(likes, NewLike);
+    get!(likes);
+    find_by!(likes, find_by_ap_url, ap_url as String);
+    find_by!(likes, find_by_user_on_post, user_id as i32, post_id as i32);
 
     pub fn update_ap_url(&self, conn: &PgConnection) {
         if self.ap_url.len() == 0 {
@@ -45,31 +43,6 @@ impl Like {
                 .set(likes::ap_url.eq(self.compute_id(conn)))
                 .get_result::<Like>(conn).expect("Couldn't update AP URL");
         }
-    }
-
-     pub fn get(conn: &PgConnection, id: i32) -> Option<Like> {
-        likes::table.filter(likes::id.eq(id))
-            .limit(1)
-            .load::<Like>(conn)
-            .expect("Error loading like by ID")
-            .into_iter().nth(0)
-    }
-
-    pub fn find_by_ap_url(conn: &PgConnection, ap_url: String) -> Option<Like> {
-        likes::table.filter(likes::ap_url.eq(ap_url))
-            .limit(1)
-            .load::<Like>(conn)
-            .expect("Error loading like by AP URL")
-            .into_iter().nth(0)
-    }
-
-    pub fn find_by_user_on_post(conn: &PgConnection, user: &User, post: &Post) -> Option<Like> {
-        likes::table.filter(likes::post_id.eq(post.id))
-            .filter(likes::user_id.eq(user.id))
-            .limit(1)
-            .load::<Like>(conn)
-            .expect("Error loading like for user and post")
-            .into_iter().nth(0)
     }
 
     pub fn delete(&self, conn: &PgConnection) -> activity::Undo {
@@ -92,20 +65,54 @@ impl Like {
 
         act
     }
-}
 
-impl Object for Like {
-    fn serialize(&self, conn: &PgConnection) -> serde_json::Value {
-        json!({
-            "id": self.compute_id(conn)
-        })
-    }
-
-    fn compute_id(&self, conn: &PgConnection) -> String {
+    pub fn compute_id(&self, conn: &PgConnection) -> String {
         format!(
             "{}/like/{}",
-            User::get(conn, self.user_id).unwrap().compute_id(conn),
-            Post::get(conn, self.post_id).unwrap().compute_id(conn)
+            User::get(conn, self.user_id).unwrap().ap_url,
+            Post::get(conn, self.post_id).unwrap().ap_url
         )
+    }
+}
+
+impl FromActivity<activity::Like> for Like {
+    fn from_activity(conn: &PgConnection, like: activity::Like, _actor: Id) -> Like {
+        let liker = User::from_url(conn, like.like_props.actor.as_str().unwrap().to_string());
+        let post = Post::find_by_ap_url(conn, like.like_props.object.as_str().unwrap().to_string());
+        let res = Like::insert(conn, NewLike {
+            post_id: post.unwrap().id,
+            user_id: liker.unwrap().id,
+            ap_url: like.object_props.id_string().unwrap_or(String::from(""))
+        });
+        res.notify(conn);
+        res
+    }
+}
+
+impl Notify for Like {
+    fn notify(&self, conn: &PgConnection) {
+        let liker = User::get(conn, self.user_id).unwrap();
+        let post = Post::get(conn, self.post_id).unwrap();
+        for author in post.get_authors(conn) {
+            let post = post.clone();
+            Notification::insert(conn, NewNotification {
+                title: "{{ data }} liked your article".to_string(),
+                data: Some(liker.display_name.clone()),
+                content: Some(post.title),
+                link: Some(post.ap_url),
+                user_id: author.id
+            });
+        }
+    }
+}
+
+impl Deletable for Like {
+    fn delete_activity(conn: &PgConnection, id: Id) -> bool {
+        if let Some(like) = Like::find_by_ap_url(conn, id.into()) {
+            like.delete(conn);
+            true
+        } else {
+            false
+        }
     }
 }

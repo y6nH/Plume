@@ -1,5 +1,6 @@
 use activitypub::{
     activity::Create,
+    link,
     object::{Article, properties::ObjectProperties}
 };
 use chrono::NaiveDateTime;
@@ -9,13 +10,13 @@ use serde_json;
 use BASE_URL;
 use activity_pub::{
     PUBLIC_VISIBILTY, ap_url, Id, IntoId,
-    actor::Actor,
-    object::Object
+    inbox::FromActivity
 };
 use models::{
     blogs::Blog,
     instance::Instance,
     likes::Like,
+    mentions::Mention,
     post_authors::PostAuthor,
     reshares::Reshare,
     users::User
@@ -23,7 +24,7 @@ use models::{
 use schema::posts;
 use safe_string::SafeString;
 
-#[derive(Queryable, Identifiable, Serialize)]
+#[derive(Queryable, Identifiable, Serialize, Clone)]
 pub struct Post {
     pub id: i32,
     pub blog_id: i32,
@@ -49,20 +50,10 @@ pub struct NewPost {
 }
 
 impl Post {
-    pub fn insert(conn: &PgConnection, new: NewPost) -> Post {
-        diesel::insert_into(posts::table)
-            .values(new)
-            .get_result(conn)
-            .expect("Error saving new post")
-    }
-
-    pub fn get(conn: &PgConnection, id: i32) -> Option<Post> {
-        posts::table.filter(posts::id.eq(id))
-            .limit(1)
-            .load::<Post>(conn)
-            .expect("Error loading post by id")
-            .into_iter().nth(0)
-    }
+    insert!(posts, NewPost);
+    get!(posts);
+    find_by!(posts, find_by_slug, slug as String, blog_id as i32);
+    find_by!(posts, find_by_ap_url, ap_url as String);
 
     pub fn count_local(conn: &PgConnection) -> usize {
         use schema::post_authors;
@@ -73,22 +64,6 @@ impl Post {
             .load::<Post>(conn)
             .expect("Couldn't load local posts")
             .len()
-    }
-
-    pub fn find_by_slug(conn: &PgConnection, slug: String) -> Option<Post> {
-        posts::table.filter(posts::slug.eq(slug))
-            .limit(1)
-            .load::<Post>(conn)
-            .expect("Error loading post by slug")
-            .into_iter().nth(0)
-    }
-
-    pub fn find_by_ap_url(conn: &PgConnection, ap_url: String) -> Option<Post> {
-        posts::table.filter(posts::ap_url.eq(ap_url))
-            .limit(1)
-            .load::<Post>(conn)
-            .expect("Error loading post by AP URL")
-            .into_iter().nth(0)
     }
 
     pub fn get_recents(conn: &PgConnection, limit: i64) -> Vec<Post> {
@@ -170,6 +145,8 @@ impl Post {
         let mut to = self.get_receivers_urls(conn);
         to.push(PUBLIC_VISIBILTY.to_string());
 
+        let mentions = Mention::list_for_post(conn, self.id).into_iter().map(|m| m.to_activity(conn)).collect::<Vec<link::Mention>>();
+
         let mut article = Article::default();
         article.object_props = ObjectProperties {
             name: Some(serde_json::to_value(self.title.clone()).unwrap()),
@@ -177,11 +154,11 @@ impl Post {
             attributed_to: Some(serde_json::to_value(self.get_authors(conn).into_iter().map(|x| x.ap_url).collect::<Vec<String>>()).unwrap()),
             content: Some(serde_json::to_value(self.content.clone()).unwrap()),
             published: Some(serde_json::to_value(self.creation_date).unwrap()),
-            tag: Some(serde_json::to_value(Vec::<serde_json::Value>::new()).unwrap()),
-            url: Some(serde_json::to_value(self.compute_id(conn)).unwrap()),
+            tag: Some(serde_json::to_value(mentions).unwrap()),
+            url: Some(serde_json::to_value(self.ap_url.clone()).unwrap()),
             to: Some(serde_json::to_value(to).unwrap()),
             cc: Some(serde_json::to_value(Vec::<serde_json::Value>::new()).unwrap()),
-            ..ObjectProperties::default()                
+            ..ObjectProperties::default()
         };
         article
     }
@@ -193,40 +170,47 @@ impl Post {
         act.create_props.set_object_object(self.into_activity(conn)).unwrap();
         act
     }
+
+    pub fn to_json(&self, conn: &PgConnection) -> serde_json::Value {
+        json!({
+            "post": self,
+            "author": self.get_authors(conn)[0].to_json(conn),
+            "url": format!("/~/{}/{}/", self.get_blog(conn).actor_id, self.slug),
+            "date": self.creation_date.timestamp()
+        })
+    }
+
+    pub fn compute_id(&self, conn: &PgConnection) -> String {
+        ap_url(format!("{}/~/{}/{}/", BASE_URL.as_str(), self.get_blog(conn).actor_id, self.slug))
+    }
+}
+
+impl FromActivity<Article> for Post {
+    fn from_activity(conn: &PgConnection, article: Article, _actor: Id) -> Post {
+        let post = Post::insert(conn, NewPost {
+            blog_id: 0, // TODO
+            slug: String::from(""), // TODO
+            title: article.object_props.name_string().unwrap(),
+            content: SafeString::new(&article.object_props.content_string().unwrap()),
+            published: true,
+            license: String::from("CC-0"),
+            ap_url: article.object_props.url_string().unwrap_or(String::from(""))
+        });
+
+        // save mentions
+        if let Some(serde_json::Value::Array(tags)) = article.object_props.tag.clone() {
+            for tag in tags.into_iter() {
+                serde_json::from_value::<link::Mention>(tag)
+                    .map(|m| Mention::from_activity(conn, m, post.id, true))
+                    .ok();
+            }
+        }
+        post
+    }
 }
 
 impl IntoId for Post {
     fn into_id(self) -> Id {
         Id::new(self.ap_url.clone())
-    }
-}
-
-impl Object for Post {
-    fn compute_id(&self, conn: &PgConnection) -> String {
-        ap_url(format!("{}/~/{}/{}/", BASE_URL.as_str(), self.get_blog(conn).actor_id, self.slug))
-    }
-
-    fn serialize(&self, conn: &PgConnection) -> serde_json::Value {
-        let mut to = self.get_receivers_urls(conn);
-        to.push(PUBLIC_VISIBILTY.to_string());
-
-        json!({
-            "type": "Article",
-            "id": self.compute_id(conn),
-            "attributedTo": self.get_authors(conn)[0].compute_id(conn),
-            "name": self.title,
-            "content": self.content,
-            "actor": self.get_authors(conn)[0].compute_id(conn),
-            "published": self.creation_date,
-            // TODO: "image": "image",
-            // TODO: "preview": "preview",
-            // TODO: "replies": "replies",
-            // TODO: "summary": "summary",
-            "tag": [],
-            // TODO: "updated": "updated",
-            "url": self.compute_id(conn),
-            "to": to,
-            "cc": []
-        })
     }
 }

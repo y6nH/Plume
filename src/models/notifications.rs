@@ -11,7 +11,8 @@ pub struct Notification {
     pub content: Option<String>,
     pub link: Option<String>,
     pub user_id: i32,
-    pub creation_date: NaiveDateTime
+    pub creation_date: NaiveDateTime,
+    pub data: Option<String>
 }
 
 #[derive(Insertable)]
@@ -20,24 +21,13 @@ pub struct NewNotification {
     pub title: String,
     pub content: Option<String>,
     pub link: Option<String>,
-    pub user_id: i32
+    pub user_id: i32,
+    pub data: Option<String>
 }
 
 impl Notification {
-    pub fn insert(conn: &PgConnection, new: NewNotification) -> Notification {
-        diesel::insert_into(notifications::table)
-            .values(new)
-            .get_result(conn)
-            .expect("Couldn't save notification")
-    }
-
-    pub fn get(conn: &PgConnection, id: i32) -> Option<Notification> {
-        notifications::table.filter(notifications::id.eq(id))
-            .limit(1)
-            .load::<Notification>(conn)
-            .expect("Couldn't load notification by ID")
-            .into_iter().nth(0)
-    }
+    insert!(notifications, NewNotification);
+    get!(notifications);
 
     pub fn find_for_user(conn: &PgConnection, user: &User) -> Vec<Notification> {
         notifications::table.filter(notifications::user_id.eq(user.id))

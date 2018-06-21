@@ -3,3 +3,6 @@ rls
 /target
 **/*.rs.bk
 rls
+translations
+po/*.po~
+.env

@@ -1,15 +1,14 @@
 {% extends "base" %}
 
 {% block title %}
-New blog
+{{ "New blog" | _ }}
 {% endblock title %}
 
 {% block content %}
-<h1>Create a blog</h1>
+<h1>{{ "Create a blog" | _ }}</h1>
 <form method="post">
-    <label for="title">Title</label>
-    <input name="title">
-
-    <input type="submit" value="Create blog"/>            
+    <label for="title">{{ "Title" | _ }}</label>
+    <input type="text" id="title" name="title" />
+    <input type="submit" value="{{ "Create blog" | _ }}"/>
 </form>
 {% endblock content %}
