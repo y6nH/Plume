@@ -1,41 +1,52 @@
-use rocket::response::{Redirect, Flash};
+use rocket::response::{Flash, Redirect};
+use rocket_i18n::I18n;
 
-use activity_pub::{broadcast, inbox::Notify};
-use db_conn::DbConn;
-use models::{
-    blogs::Blog,
-    likes,
-    posts::Post,
-    users::User
+use plume_common::activity_pub::{
+    broadcast,
+    inbox::{Deletable, Notify},
 };
+use plume_common::utils;
+use plume_models::{blogs::Blog, db_conn::DbConn, likes, posts::Post, users::User};
+use routes::errors::ErrorPage;
+use Worker;
 
-use utils;
+#[post("/~/<blog>/<slug>/like")]
+pub fn create(
+    blog: String,
+    slug: String,
+    user: User,
+    conn: DbConn,
+    worker: Worker,
+) -> Result<Redirect, ErrorPage> {
+    let b = Blog::find_by_fqn(&*conn, &blog)?;
+    let post = Post::find_by_slug(&*conn, &slug, b.id)?;
 
-#[get("/~/<blog>/<slug>/like")]
-fn create(blog: String, slug: String, user: User, conn: DbConn) -> Redirect {
-    let b = Blog::find_by_fqn(&*conn, blog.clone()).unwrap();
-    let post = Post::find_by_slug(&*conn, slug.clone(), b.id).unwrap();
+    if !user.has_liked(&*conn, &post)? {
+        let like = likes::Like::insert(&*conn, likes::NewLike::new(&post, &user))?;
+        like.notify(&*conn)?;
 
-    if !user.has_liked(&*conn, &post) {
-        let like = likes::Like::insert(&*conn, likes::NewLike {
-            post_id: post.id,
-            user_id: user.id,
-            ap_url: "".to_string()
-        });
-        like.update_ap_url(&*conn);
-        like.notify(&*conn);
-
-        broadcast(&user, like.into_activity(&*conn), user.get_followers(&*conn));
+        let dest = User::one_by_instance(&*conn)?;
+        let act = like.to_activity(&*conn)?;
+        worker.execute(move || broadcast(&user, act, dest));
     } else {
-        let like = likes::Like::find_by_user_on_post(&*conn, user.id, post.id).unwrap();
-        let delete_act = like.delete(&*conn);
-        broadcast(&user, delete_act, user.get_followers(&*conn));
+        let like = likes::Like::find_by_user_on_post(&*conn, user.id, post.id)?;
+        let delete_act = like.delete(&*conn)?;
+        let dest = User::one_by_instance(&*conn)?;
+        worker.execute(move || broadcast(&user, delete_act, dest));
     }
 
-    Redirect::to(uri!(super::posts::details: blog = blog, slug = slug))
+    Ok(Redirect::to(
+        uri!(super::posts::details: blog = blog, slug = slug, responding_to = _),
+    ))
 }
 
-#[get("/~/<blog>/<slug>/like", rank = 2)]
-fn create_auth(blog: String, slug: String) -> Flash<Redirect>{
-    utils::requires_login("You need to be logged in order to like a post", uri!(create: blog = blog, slug = slug))
+#[post("/~/<blog>/<slug>/like", rank = 2)]
+pub fn create_auth(blog: String, slug: String, i18n: I18n) -> Flash<Redirect> {
+    utils::requires_login(
+        &i18n!(
+            i18n.catalog,
+            "You need to be logged in order to like a post"
+        ),
+        uri!(create: blog = blog, slug = slug),
+    )
 }

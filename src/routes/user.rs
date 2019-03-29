@@ -1,220 +1,549 @@
-use activitypub::{
-    activity::Follow,
-    collection::OrderedCollection
+use activitypub::{activity::Create, collection::OrderedCollection};
+use atom_syndication::{Entry, FeedBuilder};
+use rocket::{
+    http::{ContentType, Cookies},
+    request::LenientForm,
+    response::{status, Content, Flash, Redirect},
 };
-use rocket::{request::Form,
-    response::{Redirect, Flash}
-};
-use rocket_contrib::Template;
+use rocket_i18n::I18n;
 use serde_json;
+use std::{borrow::Cow, collections::HashMap};
+use validator::{Validate, ValidationError, ValidationErrors};
 
-use activity_pub::{
-    ActivityStream, broadcast, Id, IntoId,
-    inbox::{Inbox, Notify}
+use inbox::{Inbox, SignedJson};
+use plume_common::activity_pub::{
+    broadcast,
+    inbox::{Deletable, FromActivity, Notify},
+    sign::{verify_http_headers, Signable},
+    ActivityStream, ApRequest, Id, IntoId,
 };
-use db_conn::DbConn;
-use models::{
+use plume_common::utils;
+use plume_models::{
     blogs::Blog,
+    db_conn::DbConn,
     follows,
+    headers::Headers,
     instance::Instance,
-    posts::Post,
+    posts::{LicensedArticle, Post},
     reshares::Reshare,
-    users::*
+    users::*,
+    Error,
 };
-use utils;
+use routes::{errors::ErrorPage, Page, PlumeRocket};
+use template_utils::Ructe;
+use Searcher;
+use Worker;
 
 #[get("/me")]
-fn me(user: Option<User>) -> Result<Redirect, Flash<Redirect>> {
+pub fn me(user: Option<User>) -> Result<Redirect, Flash<Redirect>> {
     match user {
         Some(user) => Ok(Redirect::to(uri!(details: name = user.username))),
-        None => Err(utils::requires_login("", uri!(me)))
+        None => Err(utils::requires_login("", uri!(me))),
     }
 }
 
 #[get("/@/<name>", rank = 2)]
-fn details(name: String, conn: DbConn, account: Option<User>) -> Template {
-    may_fail!(User::find_by_fqn(&*conn, name), "Couldn't find requested user", |user| {
-        let recents = Post::get_recents_for_author(&*conn, &user, 6);
-        let reshares = Reshare::get_recents_for_author(&*conn, &user, 6);
-        let user_id = user.id.clone();
-        let n_followers = user.get_followers(&*conn).len();
+pub fn details(
+    name: String,
+    rockets: PlumeRocket,
+    fetch_articles_conn: DbConn,
+    fetch_followers_conn: DbConn,
+    update_conn: DbConn,
+) -> Result<Ructe, ErrorPage> {
+    let conn = rockets.conn;
+    let user = User::find_by_fqn(&*conn, &name)?;
+    let recents = Post::get_recents_for_author(&*conn, &user, 6)?;
+    let reshares = Reshare::get_recents_for_author(&*conn, &user, 6)?;
+    let searcher = rockets.searcher;
+    let worker = rockets.worker;
 
-        Template::render("users/details", json!({
-            "user": serde_json::to_value(user.clone()).unwrap(),
-            "instance_url": user.get_instance(&*conn).public_domain,
-            "is_remote": user.instance_id != Instance::local_id(&*conn),
-            "follows": account.clone().map(|x| x.is_following(&*conn, user.id)).unwrap_or(false),
-            "account": account,
-            "recents": recents.into_iter().map(|p| p.to_json(&*conn)).collect::<Vec<serde_json::Value>>(),
-            "reshares": reshares.into_iter().map(|r| r.get_post(&*conn).unwrap().to_json(&*conn)).collect::<Vec<serde_json::Value>>(),
-            "is_self": account.map(|a| a.id == user_id).unwrap_or(false),
-            "n_followers": n_followers
-        }))
-    })
+    if !user.get_instance(&*conn)?.local {
+        // Fetch new articles
+        let user_clone = user.clone();
+        let searcher = searcher.clone();
+        worker.execute(move || {
+            for create_act in user_clone
+                .fetch_outbox::<Create>()
+                .expect("Remote user: outbox couldn't be fetched")
+            {
+                match create_act.create_props.object_object::<LicensedArticle>() {
+                    Ok(article) => {
+                        Post::from_activity(
+                            &(&*fetch_articles_conn, &searcher),
+                            article,
+                            user_clone.clone().into_id(),
+                        )
+                        .expect("Article from remote user couldn't be saved");
+                        println!("Fetched article from remote user");
+                    }
+                    Err(e) => println!("Error while fetching articles in background: {:?}", e),
+                }
+            }
+        });
+
+        // Fetch followers
+        let user_clone = user.clone();
+        worker.execute(move || {
+            for user_id in user_clone
+                .fetch_followers_ids()
+                .expect("Remote user: fetching followers error")
+            {
+                let follower = User::from_url(&*fetch_followers_conn, &user_id)
+                    .expect("user::details: Couldn't fetch follower");
+                follows::Follow::insert(
+                    &*fetch_followers_conn,
+                    follows::NewFollow {
+                        follower_id: follower.id,
+                        following_id: user_clone.id,
+                        ap_url: String::new(),
+                    },
+                )
+                .expect("Couldn't save follower for remote user");
+            }
+        });
+
+        // Update profile information if needed
+        let user_clone = user.clone();
+        if user.needs_update() {
+            worker.execute(move || {
+                user_clone
+                    .refetch(&*update_conn)
+                    .expect("Couldn't update user info");
+            });
+        }
+    }
+
+    let account = rockets.user;
+    let intl = rockets.intl;
+    Ok(render!(users::details(
+        &(&*conn, &intl.catalog, account.clone()),
+        user.clone(),
+        account
+            .and_then(|x| x.is_following(&*conn, user.id).ok())
+            .unwrap_or(false),
+        user.instance_id != Instance::get_local(&*conn)?.id,
+        user.get_instance(&*conn)?.public_domain,
+        recents,
+        reshares
+            .into_iter()
+            .filter_map(|r| r.get_post(&*conn).ok())
+            .collect()
+    )))
 }
 
 #[get("/dashboard")]
-fn dashboard(user: User, conn: DbConn) -> Template {
-    let blogs = Blog::find_for_author(&*conn, user.id);
-    Template::render("users/dashboard", json!({
-        "account": user,
-        "blogs": blogs
-    }))
+pub fn dashboard(user: User, conn: DbConn, intl: I18n) -> Result<Ructe, ErrorPage> {
+    let blogs = Blog::find_for_author(&*conn, &user)?;
+    Ok(render!(users::dashboard(
+        &(&*conn, &intl.catalog, Some(user.clone())),
+        blogs,
+        Post::drafts_by_author(&*conn, &user)?
+    )))
 }
 
 #[get("/dashboard", rank = 2)]
-fn dashboard_auth() -> Flash<Redirect> {
-    utils::requires_login("You need to be logged in order to access your dashboard", uri!(dashboard))
+pub fn dashboard_auth(i18n: I18n) -> Flash<Redirect> {
+    utils::requires_login(
+        &i18n!(
+            i18n.catalog,
+            "You need to be logged in order to access your dashboard"
+        ),
+        uri!(dashboard),
+    )
 }
 
-#[get("/@/<name>/follow")]
-fn follow(name: String, conn: DbConn, user: User) -> Redirect {
-    let target = User::find_by_fqn(&*conn, name.clone()).unwrap();
-    let f = follows::Follow::insert(&*conn, follows::NewFollow {
-        follower_id: user.id,
-        following_id: target.id
-    });
-    f.notify(&*conn);
+#[post("/@/<name>/follow")]
+pub fn follow(
+    name: String,
+    conn: DbConn,
+    user: User,
+    worker: Worker,
+) -> Result<Redirect, ErrorPage> {
+    let target = User::find_by_fqn(&*conn, &name)?;
+    if let Ok(follow) = follows::Follow::find(&*conn, user.id, target.id) {
+        let delete_act = follow.delete(&*conn)?;
+        worker.execute(move || broadcast(&user, delete_act, vec![target]));
+    } else {
+        let f = follows::Follow::insert(
+            &*conn,
+            follows::NewFollow {
+                follower_id: user.id,
+                following_id: target.id,
+                ap_url: String::new(),
+            },
+        )?;
+        f.notify(&*conn)?;
 
-    let mut act = Follow::default();
-    act.follow_props.set_actor_link::<Id>(user.clone().into_id()).unwrap();
-    act.follow_props.set_object_object(user.into_activity(&*conn)).unwrap();
-    act.object_props.set_id_string(format!("{}/follow/{}", user.ap_url, target.ap_url)).unwrap();
-
-    broadcast(&user, act, vec![target]);
-    Redirect::to(uri!(details: name = name))
+        let act = f.to_activity(&*conn)?;
+        worker.execute(move || broadcast(&user, act, vec![target]));
+    }
+    Ok(Redirect::to(uri!(details: name = name)))
 }
 
-#[get("/@/<name>/follow", rank = 2)]
-fn follow_auth(name: String) -> Flash<Redirect> {
-    utils::requires_login("You need to be logged in order to follow someone", uri!(follow: name = name))
+#[post("/@/<name>/follow", rank = 2)]
+pub fn follow_auth(name: String, i18n: I18n) -> Flash<Redirect> {
+    utils::requires_login(
+        &i18n!(
+            i18n.catalog,
+            "You need to be logged in order to subscribe to someone"
+        ),
+        uri!(follow: name = name),
+    )
 }
 
-#[get("/@/<name>/followers", rank = 2)]
-fn followers(name: String, conn: DbConn, account: Option<User>) -> Template {
-    may_fail!(User::find_by_fqn(&*conn, name.clone()), "Couldn't find requested user", |user| {
-        let user_id = user.id.clone();
+#[get("/@/<name>/followers?<page>", rank = 2)]
+pub fn followers(
+    name: String,
+    conn: DbConn,
+    account: Option<User>,
+    page: Option<Page>,
+    intl: I18n,
+) -> Result<Ructe, ErrorPage> {
+    let page = page.unwrap_or_default();
+    let user = User::find_by_fqn(&*conn, &name)?;
+    let followers_count = user.count_followers(&*conn)?;
 
-        Template::render("users/followers", json!({
-            "user": serde_json::to_value(user.clone()).unwrap(),
-            "instance_url": user.get_instance(&*conn).public_domain,
-            "is_remote": user.instance_id != Instance::local_id(&*conn),
-            "follows": account.clone().map(|x| x.is_following(&*conn, user.id)).unwrap_or(false),
-            "followers": user.get_followers(&*conn).into_iter().map(|f| f.to_json(&*conn)).collect::<Vec<serde_json::Value>>(),
-            "account": account,
-            "is_self": account.map(|a| a.id == user_id).unwrap_or(false),
-            "n_followers": user.get_followers(&*conn).len()
-        }))
-    })
+    Ok(render!(users::followers(
+        &(&*conn, &intl.catalog, account.clone()),
+        user.clone(),
+        account
+            .and_then(|x| x.is_following(&*conn, user.id).ok())
+            .unwrap_or(false),
+        user.instance_id != Instance::get_local(&*conn)?.id,
+        user.get_instance(&*conn)?.public_domain,
+        user.get_followers_page(&*conn, page.limits())?,
+        page.0,
+        Page::total(followers_count as i32)
+    )))
 }
 
-#[get("/@/<name>", format = "application/activity+json", rank = 1)]
-fn activity_details(name: String, conn: DbConn) -> ActivityStream<CustomPerson> {
-    let user = User::find_local(&*conn, name).unwrap();
-    ActivityStream::new(user.into_activity(&*conn))
+#[get("/@/<name>/followed?<page>", rank = 2)]
+pub fn followed(
+    name: String,
+    conn: DbConn,
+    account: Option<User>,
+    page: Option<Page>,
+    intl: I18n,
+) -> Result<Ructe, ErrorPage> {
+    let page = page.unwrap_or_default();
+    let user = User::find_by_fqn(&*conn, &name)?;
+    let followed_count = user.count_followed(&*conn)?;
+
+    Ok(render!(users::followed(
+        &(&*conn, &intl.catalog, account.clone()),
+        user.clone(),
+        account
+            .and_then(|x| x.is_following(&*conn, user.id).ok())
+            .unwrap_or(false),
+        user.instance_id != Instance::get_local(&*conn)?.id,
+        user.get_instance(&*conn)?.public_domain,
+        user.get_followed_page(&*conn, page.limits())?,
+        page.0,
+        Page::total(followed_count as i32)
+    )))
+}
+
+#[get("/@/<name>", rank = 1)]
+pub fn activity_details(
+    name: String,
+    conn: DbConn,
+    _ap: ApRequest,
+) -> Option<ActivityStream<CustomPerson>> {
+    let user = User::find_by_fqn(&*conn, &name).ok()?;
+    Some(ActivityStream::new(user.to_activity(&*conn).ok()?))
 }
 
 #[get("/users/new")]
-fn new(user: Option<User>) -> Template {
-    Template::render("users/new", json!({
-        "account": user
-    }))
+pub fn new(user: Option<User>, conn: DbConn, intl: I18n) -> Result<Ructe, ErrorPage> {
+    Ok(render!(users::new(
+        &(&*conn, &intl.catalog, user),
+        Instance::get_local(&*conn)?.open_registrations,
+        &NewUserForm::default(),
+        ValidationErrors::default()
+    )))
 }
 
 #[get("/@/<name>/edit")]
-fn edit(name: String, user: User) -> Option<Template> {
-    if user.username == name && !name.contains("@") {
-        Some(Template::render("users/edit", json!({
-            "account": user
-        })))
+pub fn edit(name: String, user: User, conn: DbConn, intl: I18n) -> Result<Ructe, ErrorPage> {
+    if user.username == name && !name.contains('@') {
+        Ok(render!(users::edit(
+            &(&*conn, &intl.catalog, Some(user.clone())),
+            UpdateUserForm {
+                display_name: user.display_name.clone(),
+                email: user.email.clone().unwrap_or_default(),
+                summary: user.summary,
+            },
+            ValidationErrors::default()
+        )))
     } else {
-        None
+        Err(Error::Unauthorized)?
     }
 }
 
 #[get("/@/<name>/edit", rank = 2)]
-fn edit_auth(name: String) -> Flash<Redirect> {
-    utils::requires_login("You need to be logged in order to edit your profile", uri!(edit: name = name))
+pub fn edit_auth(name: String, i18n: I18n) -> Flash<Redirect> {
+    utils::requires_login(
+        &i18n!(
+            i18n.catalog,
+            "You need to be logged in order to edit your profile"
+        ),
+        uri!(edit: name = name),
+    )
 }
 
 #[derive(FromForm)]
-struct UpdateUserForm {
-    display_name: Option<String>,
-    email: Option<String>,
-    summary: Option<String>,
+pub struct UpdateUserForm {
+    pub display_name: String,
+    pub email: String,
+    pub summary: String,
 }
 
-#[put("/@/<_name>/edit", data = "<data>")]
-fn update(_name: String, conn: DbConn, user: User, data: Form<UpdateUserForm>) -> Redirect {
-    user.update(&*conn,
-        data.get().display_name.clone().unwrap_or(user.display_name.to_string()).to_string(),
-        data.get().email.clone().unwrap_or(user.email.clone().unwrap()).to_string(),
-        data.get().summary.clone().unwrap_or(user.summary.to_string())
-    );
-    Redirect::to(uri!(me))
+#[put("/@/<_name>/edit", data = "<form>")]
+pub fn update(
+    _name: String,
+    conn: DbConn,
+    user: User,
+    form: LenientForm<UpdateUserForm>,
+) -> Result<Redirect, ErrorPage> {
+    user.update(
+        &*conn,
+        if !form.display_name.is_empty() {
+            form.display_name.clone()
+        } else {
+            user.display_name.clone()
+        },
+        if !form.email.is_empty() {
+            form.email.clone()
+        } else {
+            user.email.clone().unwrap_or_default()
+        },
+        if !form.summary.is_empty() {
+            form.summary.clone()
+        } else {
+            user.summary.to_string()
+        },
+    )?;
+    Ok(Redirect::to(uri!(me)))
 }
 
-#[derive(FromForm)]
-struct NewUserForm {
-    username: String,
-    email: String,
-    password: String,
-    password_confirmation: String
-}
+#[post("/@/<name>/delete")]
+pub fn delete(
+    name: String,
+    conn: DbConn,
+    user: User,
+    mut cookies: Cookies,
+    searcher: Searcher,
+) -> Result<Redirect, ErrorPage> {
+    let account = User::find_by_fqn(&*conn, &name)?;
+    if user.id == account.id {
+        account.delete(&*conn, &searcher)?;
 
-#[post("/users/new", data = "<data>")]
-fn create(conn: DbConn, data: Form<NewUserForm>) -> Result<Redirect, String> {
-    let form = data.get();
+        if let Some(cookie) = cookies.get_private(AUTH_COOKIE) {
+            cookies.remove_private(cookie);
+        }
 
-    if form.username.clone().len() < 1 {
-        Err(String::from("Username is required"))
-    } else if form.email.clone().len() < 1 {
-        Err(String::from("Email is required"))
-    } else if form.password.clone().len() < 8 {
-        Err(String::from("Password should be at least 8 characters long"))
-    } else if form.password == form.password_confirmation {
-        NewUser::new_local(
-            &*conn,
-            form.username.to_string(),
-            form.username.to_string(),
-            false,
-            String::from(""),
-            form.email.to_string(),
-            User::hash_pass(form.password.to_string())
-        ).update_boxes(&*conn);
-        Ok(Redirect::to(uri!(super::session::new)))
+        Ok(Redirect::to(uri!(super::instance::index)))
     } else {
-        Err(String::from("Passwords don't match"))
+        Ok(Redirect::to(uri!(edit: name = name)))
     }
+}
+
+#[derive(Default, FromForm, Validate)]
+#[validate(schema(
+    function = "passwords_match",
+    skip_on_field_errors = "false",
+    message = "Passwords are not matching"
+))]
+pub struct NewUserForm {
+    #[validate(
+        length(min = "1", message = "Username can't be empty"),
+        custom(
+            function = "validate_username",
+            message = "User name is not allowed to contain any of < > & @ ' or \""
+        )
+    )]
+    pub username: String,
+    #[validate(email(message = "Invalid email"))]
+    pub email: String,
+    #[validate(length(min = "8", message = "Password should be at least 8 characters long"))]
+    pub password: String,
+    #[validate(length(min = "8", message = "Password should be at least 8 characters long"))]
+    pub password_confirmation: String,
+}
+
+pub fn passwords_match(form: &NewUserForm) -> Result<(), ValidationError> {
+    if form.password != form.password_confirmation {
+        Err(ValidationError::new("password_match"))
+    } else {
+        Ok(())
+    }
+}
+
+pub fn validate_username(username: &str) -> Result<(), ValidationError> {
+    if username.contains(&['<', '>', '&', '@', '\'', '"', ' ', '\n', '\t'][..]) {
+        Err(ValidationError::new("username_illegal_char"))
+    } else {
+        Ok(())
+    }
+}
+
+fn to_validation(_: Error) -> ValidationErrors {
+    let mut errors = ValidationErrors::new();
+    errors.add(
+        "",
+        ValidationError {
+            code: Cow::from("server_error"),
+            message: Some(Cow::from("An unknown error occured")),
+            params: HashMap::new(),
+        },
+    );
+    errors
+}
+
+#[post("/users/new", data = "<form>")]
+pub fn create(conn: DbConn, form: LenientForm<NewUserForm>, intl: I18n) -> Result<Redirect, Ructe> {
+    if !Instance::get_local(&*conn)
+        .map(|i| i.open_registrations)
+        .unwrap_or(true)
+    {
+        return Ok(Redirect::to(uri!(new))); // Actually, it is an error
+    }
+
+    let mut form = form.into_inner();
+    form.username = form.username.trim().to_owned();
+    form.email = form.email.trim().to_owned();
+    form.validate()
+        .and_then(|_| {
+            NewUser::new_local(
+                &*conn,
+                form.username.to_string(),
+                form.username.to_string(),
+                false,
+                "",
+                form.email.to_string(),
+                User::hash_pass(&form.password).map_err(to_validation)?,
+            )
+            .map_err(to_validation)?;
+            Ok(Redirect::to(uri!(super::session::new: m = _)))
+        })
+        .map_err(|err| {
+            render!(users::new(
+                &(&*conn, &intl.catalog, None),
+                Instance::get_local(&*conn)
+                    .map(|i| i.open_registrations)
+                    .unwrap_or(true),
+                &form,
+                err
+            ))
+        })
 }
 
 #[get("/@/<name>/outbox")]
-fn outbox(name: String, conn: DbConn) -> ActivityStream<OrderedCollection> {
-    let user = User::find_local(&*conn, name).unwrap();
-    user.outbox(&*conn)
+pub fn outbox(name: String, conn: DbConn) -> Option<ActivityStream<OrderedCollection>> {
+    let user = User::find_by_fqn(&*conn, &name).ok()?;
+    user.outbox(&*conn).ok()
 }
 
 #[post("/@/<name>/inbox", data = "<data>")]
-fn inbox(name: String, conn: DbConn, data: String) -> String {
-    let user = User::find_local(&*conn, name).unwrap();
-    let act: serde_json::Value = serde_json::from_str(&data[..]).unwrap();
-    match user.received(&*conn, act) {
+pub fn inbox(
+    name: String,
+    conn: DbConn,
+    data: SignedJson<serde_json::Value>,
+    headers: Headers,
+    searcher: Searcher,
+) -> Result<String, Option<status::BadRequest<&'static str>>> {
+    let user = User::find_by_fqn(&*conn, &name).map_err(|_| None)?;
+    let act = data.1.into_inner();
+    let sig = data.0;
+
+    let activity = act.clone();
+    let actor_id = activity["actor"]
+        .as_str()
+        .or_else(|| activity["actor"]["id"].as_str())
+        .ok_or(Some(status::BadRequest(Some(
+            "Missing actor id for activity",
+        ))))?;
+
+    let actor = User::from_url(&conn, actor_id).expect("user::inbox: user error");
+    if !verify_http_headers(&actor, &headers.0, &sig).is_secure() && !act.clone().verify(&actor) {
+        // maybe we just know an old key?
+        actor
+            .refetch(&conn)
+            .and_then(|_| User::get(&conn, actor.id))
+            .and_then(|actor| {
+                if verify_http_headers(&actor, &headers.0, &sig).is_secure()
+                    || act.clone().verify(&actor)
+                {
+                    Ok(())
+                } else {
+                    Err(Error::Signature)
+                }
+            })
+            .map_err(|_| {
+                println!(
+                    "Rejected invalid activity supposedly from {}, with headers {:?}",
+                    actor.username, headers.0
+                );
+                status::BadRequest(Some("Invalid signature"))
+            })?;
+    }
+
+    if Instance::is_blocked(&*conn, actor_id).map_err(|_| None)? {
+        return Ok(String::new());
+    }
+    Ok(match user.received(&*conn, &searcher, act) {
         Ok(_) => String::new(),
         Err(e) => {
-            println!("User inbox error: {}\n{}", e.cause(), e.backtrace());
-            format!("Error: {}", e.cause())
+            println!("User inbox error: {}\n{}", e.as_fail(), e.backtrace());
+            format!("Error: {}", e.as_fail())
         }
-    }
+    })
 }
 
-#[get("/@/<name>/followers", format = "application/activity+json")]
-fn ap_followers(name: String, conn: DbConn) -> ActivityStream<OrderedCollection> {
-    let user = User::find_local(&*conn, name).unwrap();
-    let followers = user.get_followers(&*conn).into_iter().map(|f| Id::new(f.ap_url)).collect::<Vec<Id>>();
+#[get("/@/<name>/followers", rank = 1)]
+pub fn ap_followers(
+    name: String,
+    conn: DbConn,
+    _ap: ApRequest,
+) -> Option<ActivityStream<OrderedCollection>> {
+    let user = User::find_by_fqn(&*conn, &name).ok()?;
+    let followers = user
+        .get_followers(&*conn)
+        .ok()?
+        .into_iter()
+        .map(|f| Id::new(f.ap_url))
+        .collect::<Vec<Id>>();
 
     let mut coll = OrderedCollection::default();
-    coll.object_props.set_id_string(format!("{}/followers", user.ap_url)).expect("Follower collection: id error");
-    coll.collection_props.set_total_items_u64(followers.len() as u64).expect("Follower collection: totalItems error");
-    coll.collection_props.set_items_link_vec(followers).expect("Follower collection: items error");
-    ActivityStream::new(coll)
+    coll.object_props
+        .set_id_string(user.followers_endpoint)
+        .ok()?;
+    coll.collection_props
+        .set_total_items_u64(followers.len() as u64)
+        .ok()?;
+    coll.collection_props.set_items_link_vec(followers).ok()?;
+    Some(ActivityStream::new(coll))
+}
+
+#[get("/@/<name>/atom.xml")]
+pub fn atom_feed(name: String, conn: DbConn) -> Option<Content<String>> {
+    let author = User::find_by_fqn(&*conn, &name).ok()?;
+    let feed = FeedBuilder::default()
+        .title(author.display_name.clone())
+        .id(Instance::get_local(&*conn)
+            .unwrap()
+            .compute_box("~", &name, "atom.xml"))
+        .entries(
+            Post::get_recents_for_author(&*conn, &author, 15)
+                .ok()?
+                .into_iter()
+                .map(|p| super::post_to_atom(p, &*conn))
+                .collect::<Vec<Entry>>(),
+        )
+        .build()
+        .expect("user::atom_feed: Error building Atom feed");
+    Some(Content(
+        ContentType::new("application", "atom+xml"),
+        feed.to_string(),
+    ))
 }
